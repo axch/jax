@@ -1,5 +1,7 @@
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
+
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_enable_x64', True)
 
@@ -73,6 +75,11 @@ def foo(jaxpr: core.ClosedJaxpr, *args):
   zero_perturbations = {v: ad_util.zeros_like_aval(v.aval) for v in perturbation_env}
   sensitivity_env = jax.grad(make_perturbation_fn(jaxpr))(zero_perturbations, *args)
 
+  # Each score is proportional to the relative error in that
+  # intermediate, times the condition number of the answer with
+  # respect to it.  The constant of proportionality is the final
+  # value.  The value of the intermediate cancels from this computation,
+  # leaving (error * derivative).
   scores = {v: jnp.vdot(perturbation_env[v] / env[v], sensitivity_env[v])
             for v in perturbation_env}
   worst_offender = max((v for eqn in jaxpr.jaxpr.eqns for v in eqn.outvars),
@@ -85,7 +92,8 @@ def foo(jaxpr: core.ClosedJaxpr, *args):
           f"but the output(s) had value / absolute / relative error:\n" +
           '\n'.join(f'  {env[v]} / {perturbation_env[v]} / {perturbation_env[v] / env[v]}'
                     for v in eqn.outvars) + '\n' +
-          f"and this resulted in an elasticity score of {scores[worst_offender]}\n"
+          f"with an output sensitivity of {sensitivity_env[worst_offender]};\n" +
+          f"this resulted in an elasticity score of {scores[worst_offender]}\n"
           )
 
 x64_to_x32 = {
@@ -137,18 +145,98 @@ def make_perturbation_fn(jaxpr: core.ClosedJaxpr) -> Callable:
 # jaxpr = jax.make_jaxpr(log1p)(x)
 # foo(jaxpr, x)
 
-def exp_gamma_log_prob(concentration, log_rate, x):
+# TODO recurse into higher-order primitives
+
+def exp_gamma_log_prob(concentration, log_rate, x, foo, bar):
   y = jnp.exp(x + log_rate)
   log_unnormalized_prob = concentration * x - y
   # log_unnormalized_prob = (1e1 + log_unnormalized_prob_) - 1e1
   log_normalization = jax.lax.lgamma(concentration) - concentration * log_rate
-  return log_unnormalized_prob - log_normalization
+  ans = log_unnormalized_prob - log_normalization
+  quux = foo - bar
+  return ans + quux
 
-jaxpr = jax.make_jaxpr(exp_gamma_log_prob)(117.67729, 159.94534, -155.34862)
-foo(jaxpr, 117.67729, 159.94534, -155.34862)
+conc = 117.67729
+log_rate = 159.94534
+x = -155.34862
+frob = 1400.0
+bar = 1399.1
+
+jaxpr = jax.make_jaxpr(exp_gamma_log_prob)(conc, log_rate, x, frob, bar)
+foo(jaxpr, conc, log_rate, x, frob, bar)
 
 
+def norm_pytree(stuff):
+  stuff_v, _ = ravel_pytree(stuff)
+  print(stuff_v, type(stuff_v))
+  return jnp.linalg.norm(stuff_v)
 
+def condition_number(f, *args, **kwargs):
+  fx, grads = jax.value_and_grad(f, argnums=range(len(args)))(*args, **kwargs)
+  return norm_pytree(args) * norm_pytree(grads) / jnp.abs(fx)
 
+# print(condition_number(exp_gamma_log_prob, 117.67729, 159.94534, -155.34862))
 
-# TODO recurse into higher-order primitives
+def exp_gamma_log_prob_offset(concentration, x_offset):
+  """Semantically equal to
+    exp_gamma_log_prob(concentration, log_rate, x_offset - log_rate)
+  but computed more accurately.
+  This is useful when you want
+    exp_gamma_log_prob(concentration, log_rate, x)
+  but it's ill-conditioned because x ~= -log_rate.
+  If, in addition, you have access to
+    x_offset = x + log_rate
+  more accurately than just computing that, then you can use this function.
+  """
+  y = jnp.exp(x_offset)
+  log_unnormalized_prob_offset = concentration * x_offset - y
+  log_normalization_offset = jax.lax.lgamma(concentration)
+  return log_unnormalized_prob_offset - log_normalization_offset
+
+offset = x + log_rate
+
+jaxpr2 = jax.make_jaxpr(exp_gamma_log_prob_offset)(conc, offset)
+# foo(jaxpr2, conc, offset)
+
+print(condition_number(exp_gamma_log_prob_offset, conc, offset))
+
+# Experience report
+
+# The `foo` tool is useful.  I already knew that the problem was a
+# catastrophic cancellation between log_unnormalized_prob and
+# log_normalization, but the tool clued me in that the cancellation in
+# x + log_prob was also important -- it induced small relative error
+# in the intermediate value, but had a relatively high elasticity
+# score (by virtue of passing through `exp`) (though still 2 orders of
+# magnitude lower than the catastrophic cancellation).  This led me to
+# try `exp_gamma_log_prob_offset`, pushing the computation of x +
+# log_prob to the client in hopes that they may be able to do it more
+# accurately due to knowing something about where x and log_rate came
+# from.  The result is both significantly better conditioned and
+# computable far more accurately.  However, it is still less than
+# perfect on both counts, because there is still a catastrophic
+# cancellation between log_unnormalized_prob_offset and
+# log_normalization_offset.  It's just ~2 orders of magnitude less
+# catastrophic than before (on these inputs).
+
+# Can't tell what the right formula is.  We tried
+#   score(v) = <relative error at v> * <d ans / dv>
+# and it seemed to do well on this problem.  It seems more sensible
+# to use
+#   score2(v) = <relative error at v> * <condition number of ans wrt v>.
+#
+# The relationship between these is that
+#   score2(v) = v * score(v) / ans.
+# Since ans doesn't vary, dividing by it has no effect on the ordering
+# of the v by their scores, so we're just multiying by the value of
+# the intermediate.
+#
+# I tried score2, but it performed worse than score: it painted all
+# the additive terms at the end; it seems like it was saying "there is
+# a problem downstream of this that this intermediate contributes to",
+# instead of pegging the location of said problem.  In particular,
+# those terms all had small relative error and high score2, because
+# they were themselves large.
+#
+# Now that I think about it, we also have
+#   score2(v) = <absolute error at v> * <d ans / dv> / ans.
